@@ -38,6 +38,11 @@
 - **run 双通道**：有新告警即时推；到点推送定时报告；`--force` 立即推一次定时报告并更新时间戳。
 - **bot 启动推送**：进入长轮询前先推一条“服务已启动”状态。
 
+### Phase 4（Telegram HTTP 代理）
+- **配置 `telegram_proxy`**：默认 `""`（直连）；填写后 Telegram 的 `sendMessage` / `getUpdates` 全部经该 HTTP/HTTPS 代理，适配国内服务器无法直连 `api.telegram.org` 的场景。
+- **只影响 Telegram**：企业微信（`qyapi.weixin.qq.com` 国内可直连）的发送函数完全不读取该配置，始终直连。
+- **安全与容错**：代理 URL 中的 `user:pass` 认证信息在日志中打码；`socks5://` 等不支持的 scheme 记 WARNING 后回退直连；代理连接失败只记 ERROR 日志并返回 False / 触发退避，绝不抛出。
+
 ## 推送机制
 
 ### 双通道
@@ -88,6 +93,39 @@
   🟡 [WARNING] memory memory — 使用率 92.5% ≥ 阈值 90
 ```
 
+## Telegram 代理
+
+### 为什么需要
+国内不少服务器**直连 `api.telegram.org` 不通**（连接超时 / 被重置），但本机通常已经跑着
+Clash 之类的 HTTP 代理（例如 `127.0.0.1:7890`）。此时给 Telegram 配一个出口代理即可
+正常收发消息，而**企业微信 `qyapi.weixin.qq.com` 国内可直连，必须继续走直连**，
+不能因为全局代理而绕远路或受影响。
+
+### 怎么填
+在 `config.json` 中新增（留空即直连）：
+
+```json
+{
+  "telegram_bot_token": "123456:ABC...",
+  "telegram_proxy": "http://127.0.0.1:7890",
+  "telegram_allowed_chat_ids": [123456789]
+}
+```
+
+- 支持 `http://` / `https://`；代理需要认证时写成 `http://user:pass@127.0.0.1:7890`。
+- **留空（默认）** = 直连，行为与之前完全一致。
+- 只有 **http/https** 可用；若填 `socks5://...` 之类 urllib 原生不支持的协议，程序会记一条
+  WARNING 并**自动回退直连**，不会崩溃。
+- 代理主机填 `127.0.0.1` 时，注意 systemd 服务与代理需在同一网络命名空间；
+  若服务以其他用户运行，确认该用户能访问代理端口。
+
+### 作用范围
+- ✅ 生效：`sendMessage`（主动推送 + Bot 回复）、`getUpdates`（长轮询）。
+- ❌ 不影响：企业微信 Webhook、SSH / 磁盘 / 内存 / 负载 / 进程等本地采集。
+- 🔒 日志安全：代理 URL 中的 `user:pass` 认证信息在日志里一律打码为 `****`。
+- 🛟 容错：代理拒绝 / 超时只会记 ERROR 日志并返回失败（长轮询触发指数退避），
+  绝不抛出异常，也不会改变 `run` / `bot` 的退出码。
+
 ## 快速开始
 
 1. **准备配置**
@@ -125,7 +163,8 @@
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `wecom_webhook` | string | `""` | 企业微信机器人 Webhook 地址；为空时跳过推送。**属敏感凭据，日志中会打码。** |
-| `telegram_bot_token` | string | `""` | Telegram Bot Token；为空时 `bot` 命令报错并退出（exit 2）。 |
+| `telegram_bot_token` | string | `""` | Telegram Bot Token；为空时 `bot` 命令报错并退出（exit 2）。**属敏感凭据，日志中会打码。** |
+| `telegram_proxy` | string | `""` | Telegram 专用 HTTP/HTTPS 代理，如 `http://127.0.0.1:7890`（可含 `user:pass@`）；为空 = 直连。**只影响 Telegram，企业微信不受影响。** |
 | `telegram_allowed_chat_ids` | int 列表 | `[]` | Telegram 白名单 chat.id；为空时所有消息都会被忽略。 |
 | `ssh_threshold` | int | `20` | SSH 失败次数达到该值才产生 critical 事件。 |
 | `ssh_window_hours` | int | `1` | SSH 失败统计时间窗口（小时）。 |

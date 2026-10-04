@@ -1,6 +1,8 @@
 {
   "wecom_webhook": "",
   "telegram_bot_token": "",
+  "_comment_telegram_proxy": "仅 Telegram 走此 HTTP 代理（企业微信直连不受影响）；示例 http://127.0.0.1:7890，支持 http://user:pass@host:port，留空 = 直连。仅支持 http/https。",
+  "telegram_proxy": "",
   "telegram_allowed_chat_ids": [123456789],
   "ssh_threshold": 20,
   "ssh_window_hours": 1,

@@ -24,10 +24,17 @@ Phase 3 功能（双通道主动推送）：
   * run：新告警即时推 + 到点推送定时报告，均走企业微信与 Telegram 双通道
   * bot：启动时先推送一条“服务已启动”状态，再进入 getUpdates 长轮询
 
+Phase 4 功能（Telegram HTTP 代理）：
+  * 新增配置 telegram_proxy（默认 ""）：仅 Telegram 的 sendMessage / getUpdates 走代理
+  * 企业微信（qyapi.weixin.qq.com 国内可直连）完全不读取该配置，不受代理影响
+  * 仅支持 http/https 代理；socks5 等原生不支持的 scheme 记 WARNING 后回退直连
+  * 代理 URL 中的 user:pass 认证信息在日志中一律打码
+  * 代理连接失败与普通网络异常同等处理：记日志、返回 False / 触发退避，绝不抛出
+
 设计原则：
   * 仅标准库，兼容 Python 3.8+（不使用 match、不使用运行时 X | Y 联合类型）
   * 每个采集器自带异常隔离：单个采集器失败只记日志，绝不拖垮整个 run
-  * 日志一律带时间戳；企业微信 Webhook / Telegram Token 绝不原样输出（必须打码）
+  * 日志一律带时间戳；企业微信 Webhook / Telegram Token / 代理 userinfo 绝不原样输出（必须打码）
   * 推送失败只记日志，绝不影响 run / bot 的正常流程与退出码
 """
 
@@ -43,6 +50,7 @@ import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,6 +68,9 @@ DEFAULT_CONFIG_PATH = "~/.config/sentinel/config.json"
 DEFAULT_CONFIG = {
     "wecom_webhook": "",
     "telegram_bot_token": "",
+    # Telegram 专用 HTTP 代理，形如 "http://127.0.0.1:7890"（可含 user:pass@）。
+    # 为空 = 直连；仅作用于 Telegram，企业微信不读取该字段。
+    "telegram_proxy": "",
     "telegram_allowed_chat_ids": [],
     "ssh_threshold": 20,
     "ssh_window_hours": 1,
@@ -189,6 +200,9 @@ def load_config() -> Dict[str, Any]:
                 raise ValueError("配置根节点必须是 JSON 对象")
             # 只合并已知字段，未知字段忽略，保证前向兼容
             for key, value in data.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    # 下划线开头的键视为注释（JSON 标准不支持注释），静默跳过
+                    continue
                 if key in config:
                     config[key] = value
                 else:
@@ -201,6 +215,7 @@ def load_config() -> Dict[str, Any]:
     # 类型规整：把用户可能写错类型的字段转回正确类型
     config["wecom_webhook"] = str(config.get("wecom_webhook") or "")
     config["telegram_bot_token"] = str(config.get("telegram_bot_token") or "")
+    config["telegram_proxy"] = str(config.get("telegram_proxy") or "")
     config["telegram_allowed_chat_ids"] = _coerce_str_list(
         config.get("telegram_allowed_chat_ids"), DEFAULT_CONFIG["telegram_allowed_chat_ids"]
     )
@@ -1562,15 +1577,70 @@ def _mask_token(token: str) -> str:
     return token[:4] + "****" + token[-4:]
 
 
+def _normalize_telegram_proxy(proxy: Any) -> str:
+    """
+    校验并规整 Telegram 代理 URL。
+
+    仅支持 http / https 代理；socks5:// 等 urllib 原生不支持的 scheme，
+    或缺少主机名的非法地址，一律记 WARNING 并返回 ""（调用方回退直连），
+    绝不抛异常。返回值为可直接交给 urllib ProxyHandler 的原始 URL。
+    """
+    raw = str(proxy or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception as exc:
+        log("Telegram 代理 URL 解析失败（%s），回退直连" % exc, "WARNING")
+        return ""
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        log("不支持的 Telegram 代理协议：%s（仅支持 http/https），回退直连"
+            % (scheme or "(空)"), "WARNING")
+        return ""
+    if not parsed.hostname:
+        log("Telegram 代理 URL 缺少主机名：%s，回退直连" % mask_proxy(raw), "WARNING")
+        return ""
+    return raw
+
+
+def mask_proxy(proxy: str) -> str:
+    """
+    对代理 URL 打码：只保留协议、主机、端口与路径，userinfo 一律替换为 ****。
+
+    代理可能形如 http://user:pass@127.0.0.1:7890，认证信息绝不能原样落日志。
+    """
+    raw = str(proxy or "").strip()
+    if not raw:
+        return "(未配置)"
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if not parsed.hostname:
+            return "****(已打码)"
+        auth = "****@" if (parsed.username is not None or parsed.password is not None) else ""
+        try:
+            port = ":%d" % parsed.port if parsed.port else ""
+        except ValueError:
+            # 端口非法（如 http://host:abc）时，端口信息直接省略
+            port = ""
+        return "%s://%s%s%s%s" % (
+            parsed.scheme or "http", auth, parsed.hostname, port, parsed.path or "")
+    except Exception:
+        # 极端情况下连解析都失败，返回完全掩码，绝不泄露原文
+        return "****(已打码)"
+
+
 def _telegram_call(
     token: str,
     method: str,
     payload: Optional[Dict[str, Any]] = None,
     timeout: int = 30,
+    proxy: str = "",
 ) -> Any:
     """
     调用 Telegram Bot API，成功返回 result 字段，失败返回 None。
 
+    proxy 非空时通过 urllib ProxyHandler 走 HTTP/HTTPS 代理；为空则保持直连。
     绝不抛异常（KeyboardInterrupt 除外）：网络 / HTTP / JSON 解析错误只记日志。
     """
     url = _telegram_api_url(token, method)
@@ -1580,6 +1650,10 @@ def _telegram_call(
         log("Telegram 参数序列化失败（%s）：%s" % (method, exc), "ERROR")
         return None
 
+    # 再做一次校验与回退：即使调用方直接传入 socks5 等非法 scheme 也不会崩
+    resolved_proxy = _normalize_telegram_proxy(proxy)
+    proxy_desc = mask_proxy(resolved_proxy) if resolved_proxy else ""
+
     try:
         # Request 构造也放进 try：非法 URL（如 token 含空格/特殊字符）可能抛 ValueError
         request = urllib.request.Request(
@@ -1588,21 +1662,42 @@ def _telegram_call(
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="ignore")
+        if resolved_proxy:
+            # 仅 Telegram 请求使用该 opener；企业微信仍走全局默认（直连）
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": resolved_proxy, "https": resolved_proxy})
+            )
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+        else:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
-        log("Telegram API HTTP 错误（%s）：%s %s" % (method, exc, detail[:200]), "WARNING")
+        if resolved_proxy:
+            log("Telegram API HTTP 错误（%s，经代理 %s）：%s %s"
+                % (method, proxy_desc, exc, detail[:200]), "ERROR")
+        else:
+            log("Telegram API HTTP 错误（%s）：%s %s" % (method, exc, detail[:200]), "WARNING")
         return None
     except urllib.error.URLError as exc:
-        log("Telegram API 网络错误（%s）：%s" % (method, exc), "WARNING")
+        # 代理拒绝/超时同样归结为网络异常：记 ERROR（含“代理”字样便于排查）后返回 None
+        if resolved_proxy:
+            log("Telegram API 代理连接失败（%s，代理 %s）：%s"
+                % (method, proxy_desc, exc), "ERROR")
+        else:
+            log("Telegram API 网络错误（%s）：%s" % (method, exc), "WARNING")
         return None
     except Exception as exc:
-        log("Telegram API 调用异常（%s）：%s" % (method, exc), "ERROR")
+        if resolved_proxy:
+            log("Telegram API 调用异常（%s，代理 %s）：%s"
+                % (method, proxy_desc, exc), "ERROR")
+        else:
+            log("Telegram API 调用异常（%s）：%s" % (method, exc), "ERROR")
         return None
 
     try:
@@ -1618,11 +1713,14 @@ def _telegram_call(
     return parsed.get("result")
 
 
-def _telegram_get_updates(token: str, offset: Optional[int]) -> Optional[List[Dict[str, Any]]]:
+def _telegram_get_updates(
+    token: str, offset: Optional[int], proxy: str = ""
+) -> Optional[List[Dict[str, Any]]]:
     """
     getUpdates 长轮询。
 
     服务端 timeout=30，客户端超时留余量设 35，避免服务端还在长轮询时客户端先超时。
+    proxy 非空时经 HTTP/HTTPS 代理访问。
     返回 None 表示调用失败（触发上层指数退避）；返回 [] 表示本次无更新。
     """
     payload: Dict[str, Any] = {
@@ -1631,18 +1729,18 @@ def _telegram_get_updates(token: str, offset: Optional[int]) -> Optional[List[Di
     }
     if offset is not None:
         payload["offset"] = offset
-    result = _telegram_call(token, "getUpdates", payload, timeout=35)
+    result = _telegram_call(token, "getUpdates", payload, timeout=35, proxy=proxy)
     if result is None:
         return None
     return result if isinstance(result, list) else []
 
 
-def send_telegram_message(token: str, chat_id: Any, text: str) -> bool:
+def send_telegram_message(token: str, chat_id: Any, text: str, proxy: str = "") -> bool:
     """
     发送纯文本 Telegram 消息（不设置 parse_mode，避免动态内容触发解析错误）。
 
     token / chat_id 为空直接返回 False；网络异常 / HTTP 错误 / Telegram 返回
-    ok=false 只记日志并返回 False，绝不抛异常。
+    ok=false 只记日志并返回 False，绝不抛异常。proxy 非空时经 HTTP/HTTPS 代理。
     """
     if not token:
         log("未配置 telegram_bot_token，跳过 Telegram 发送", "INFO")
@@ -1658,7 +1756,7 @@ def send_telegram_message(token: str, chat_id: Any, text: str) -> bool:
         "disable_web_page_preview": True,
     }
     # _telegram_call 已统一处理网络/HTTP/ok=false 异常，成功返回 result、失败返回 None
-    return _telegram_call(token, "sendMessage", payload, timeout=10) is not None
+    return _telegram_call(token, "sendMessage", payload, timeout=10, proxy=proxy) is not None
 
 
 def push_telegram(config: Dict[str, Any], text: str) -> bool:
@@ -1666,6 +1764,7 @@ def push_telegram(config: Dict[str, Any], text: str) -> bool:
     主动向 telegram_allowed_chat_ids 中的每个 chat 推送同一条文本。
 
     token 为空或白名单为空时只记 INFO 并跳过；逐个发送，任一失败不影响其余。
+    telegram_proxy 非空时所有 Telegram 请求经该 HTTP/HTTPS 代理。
     返回 True 表示至少有一个 chat 发送成功。
     """
     token = str(config.get("telegram_bot_token") or "").strip()
@@ -1682,15 +1781,21 @@ def push_telegram(config: Dict[str, Any], text: str) -> bool:
         return False
 
     success = 0
+    # 只读取 telegram_proxy；企业微信发送函数完全不感知该配置
+    proxy = _normalize_telegram_proxy(config.get("telegram_proxy"))
+    if proxy:
+        log("Telegram 推送使用代理：%s" % mask_proxy(proxy), "INFO")
     for chat_id in chat_ids:
-        if send_telegram_message(token, chat_id, text):
+        if send_telegram_message(token, chat_id, text, proxy=proxy):
             success += 1
     log("Telegram 推送完成：成功 %d/%d" % (success, len(chat_ids)), "INFO")
     return success > 0
 
 
-def process_update(config: Dict[str, Any], token: str, update: Dict[str, Any]) -> None:
-    """处理单条 update：白名单校验 -> 命令分发 -> 回复。"""
+def process_update(
+    config: Dict[str, Any], token: str, update: Dict[str, Any], proxy: str = ""
+) -> None:
+    """处理单条 update：白名单校验 -> 命令分发 -> 回复（proxy 仅用于 Telegram）。"""
     if not isinstance(update, dict):
         return
     message = update.get("message") or update.get("edited_message")
@@ -1704,14 +1809,14 @@ def process_update(config: Dict[str, Any], token: str, update: Dict[str, Any]) -
         return
     text = message.get("text") or message.get("caption") or ""
     reply = handle_command(config, text)
-    send_telegram_message(token, chat_id, reply)
+    send_telegram_message(token, chat_id, reply, proxy=proxy)
 
 
 def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int:
     """
     bot 主循环：getUpdates 长轮询，offset 推进，网络异常指数退避。
 
-    Ctrl+C（KeyboardInterrupt）时优雅退出并返回 0。
+    telegram_proxy 非空时全流程走代理；Ctrl+C（KeyboardInterrupt）时优雅退出并返回 0。
     """
     if token is None:
         token = str(config.get("telegram_bot_token") or "").strip()
@@ -1719,8 +1824,12 @@ def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int
         log("未配置 telegram_bot_token，无法启动 Telegram bot", "ERROR")
         return 2
 
+    # 启动时解析一次代理：非法 scheme 在此记一次 WARNING 并回退直连，避免轮询中刷屏
+    proxy = _normalize_telegram_proxy(config.get("telegram_proxy"))
     allowed = _allowed_chat_id_set(config)
     log("Telegram bot 启动：token=%s 白名单数量=%d" % (_mask_token(token), len(allowed)), "INFO")
+    if proxy:
+        log("Telegram 使用代理：%s" % mask_proxy(proxy), "INFO")
     if not allowed:
         log("telegram_allowed_chat_ids 为空：所有消息都会被忽略（请在配置中添加 chat_id）", "WARNING")
 
@@ -1739,7 +1848,7 @@ def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int
     backoff = 1
     while True:
         try:
-            updates = _telegram_get_updates(token, offset)
+            updates = _telegram_get_updates(token, offset, proxy=proxy)
             if updates is None:
                 # 网络异常：指数退避，最长 60 秒，避免打爆 Telegram
                 log("getUpdates 失败，%d 秒后重试" % backoff, "WARNING")
@@ -1753,7 +1862,7 @@ def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int
                     # offset 推进：下次只取比已处理 update_id 更大的更新
                     offset = update_id + 1
                 try:
-                    process_update(config, token, update)
+                    process_update(config, token, update, proxy=proxy)
                 except Exception as exc:
                     log("处理 Telegram update 异常：%s" % exc, "ERROR")
         except KeyboardInterrupt:

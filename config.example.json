@@ -10,5 +10,6 @@
   "watch_processes": ["sshd"],
   "dedup_hours": 1,
   "db_path": "~/.local/share/sentinel/sentinel.db",
-  "max_push_bytes": 4000
+  "max_push_bytes": 4000,
+  "report_interval_hours": 3
 }

@@ -1,7 +1,8 @@
 # Server Sentinel
 
 轻量级服务器监控 / 告警单文件工具。仅依赖 Python 3.8+ 标准库，零第三方依赖，
-一个 `sentinel.py` 即可完成采集、去重、入库、企业微信推送与 Telegram 交互。
+一个 `sentinel.py` 即可完成采集、去重、入库，并通过**企业微信 + Telegram 双通道**
+主动推送告警与定时报告；Telegram 同时保留交互式 Bot。
 
 ## 功能列表
 
@@ -13,9 +14,9 @@
   - 内存使用率：基于 `/proc/meminfo` 的 `MemAvailable` 计算，旧内核自动兜底。
   - 系统负载：`/proc/loadavg` 1 分钟负载与核数阈值比较。
   - 关键进程：`ps -eo comm=` 检查 `watch_processes` 是否存活。
-- **存储层**：sqlite3 事件入库、索引、最近 N 小时历史查询。
+- **存储层**：sqlite3 事件入库、索引、最近 N 小时历史查询，`meta` 表记录定时报告时间戳。
 - **规则层**：按 `key` + 时间窗去重，抑制告警风暴（采集 → 过滤 → 入库 → 推送）。
-- **企业微信推送**：Markdown，按 UTF-8 字节安全截断，网络异常不抛出。
+- **企业微信推送**：Webhook，按 UTF-8 字节安全截断，网络异常不抛出。
 
 ### Phase 2（Telegram Bot）
 - **长轮询主循环**：`getUpdates`（`timeout=30`）+ `offset` 推进，网络异常指数退避（最长 60 秒），`Ctrl+C` 优雅退出。
@@ -25,8 +26,67 @@
   - `/status`：实时状态（1 分钟负载、内存使用率、根分区磁盘使用率、系统运行时间）。
   - `/ssh`：最近 1 小时 `category='ssh'` 事件按来源 IP 聚合展示。
   - 未知命令：提示使用 `/help`。
-- **回复**：`sendMessage` + `parse_mode=Markdown`，动态内容做最小转义，失败自动降级纯文本重发。
+- **回复**：`sendMessage` 纯文本（不设 `parse_mode`），网络/HTTP/`ok=false` 只记日志不抛出。
 - **仅标准库**：全部通过 `urllib.request` 实现，不引入第三方 SDK。
+
+### Phase 3（双通道主动推送）
+- **统一文本构建器（纯函数，可离线测试）**：
+  - `gather_server_info()`：复用底层读取，返回负载 / 内存 / 根分区 / 运行时间快照，单项失败填“未知”。
+  - `build_report_text(server_info, events, title=...)`：输出统一纯文本报告（emoji 小节标题、键名冒号对齐、每条事件一行）。
+- **Telegram 主动发送**：`send_telegram_message` / `push_telegram` 通过 `urllib` 直接调用 `sendMessage`，不依赖长轮询。
+- **定时报告**：`meta.last_report_ts` + `is_report_due`，默认每 3 小时（`report_interval_hours`）推一次。
+- **run 双通道**：有新告警即时推；到点推送定时报告；`--force` 立即推一次定时报告并更新时间戳。
+- **bot 启动推送**：进入长轮询前先推一条“服务已启动”状态。
+
+## 推送机制
+
+### 双通道
+所有主动推送（告警、定时报告、bot 启动通知）都会**同时尝试企业微信与 Telegram 两个通道**：
+
+- 企业微信：配置 `wecom_webhook` 后生效，内容按 `max_push_bytes` 做 UTF-8 字节安全截断。
+- Telegram：配置 `telegram_bot_token` 后，向 `telegram_allowed_chat_ids` 中的**每个** chat 各发一份。
+
+任一通道未配置只记一条 INFO 日志跳过；发送失败（网络异常 / HTTP 错误 / 对方返回错误）
+只记日志，**绝不影响 `run` / `bot` 的退出码或主流程**。
+
+### 告警即时推
+`run` 每次采集后先去重：本次出现、且最近 `dedup_hours` 小时内未出现过的 `key`
+视为“新告警”，立即以标题 `🚨 Server Sentinel 告警` 推送到双通道。
+
+### 定时报告（默认 3 小时）
+即使没有告警，也会按 `report_interval_hours`（默认 `3` 小时）推送一次常规状态报告：
+
+- 首次运行（`meta.last_report_ts` 不存在）立即推一次；
+- 之后 `now - last_report_ts >= report_interval_hours * 3600` 时再推；
+- 每次推送成功后写回 `last_report_ts`（epoch 秒，存于 sqlite 的 `meta` 表）；
+- `run --force` 忽略时间间隔，立即推一次定时报告并更新时间戳。
+
+报告标题为 `📋 Server Sentinel 定时报告`，内容包含**常规服务器状态 + 本次新事件**；
+无事件时事件区显示 `✅ 一切正常，无异常事件`。
+
+### bot 启动推送
+`bot` 命令在进入 `getUpdates` 长轮询前，会先推送一条标题为
+`🚀 Server Sentinel 服务已启动` 的状态消息。注意：在 `systemd Restart=always`
+下，每次服务重启都会推送一次启动消息，这是**符合预期**的行为，可用作进程存活信号。
+
+### 纯文本版式
+推送内容统一为高可读纯文本（无 Markdown 语法依赖）：emoji 小节标题、分区之间空行、
+键名冒号按显示宽度对齐、每条事件一行含 `severity / category / key / 一句话摘要`。示例：
+
+```
+🖥️ Server Sentinel
+⏰ 2026-10-04 11:40:00
+
+📊 服务器状态
+  1分钟负载 : 0.59 (2 核)
+  内存使用  : 92.5% (7.2 / 7.7 GB)
+  根分区磁盘: 1.3%
+  运行时间  : 3小时42分
+
+🚨 异常事件 (2)
+  🔴 [CRITICAL] process proc:sshd — 进程 sshd 未运行
+  🟡 [WARNING] memory memory — 使用率 92.5% ≥ 阈值 90
+```
 
 ## 快速开始
 
@@ -55,6 +115,8 @@
      sudo systemctl daemon-reload
      sudo systemctl enable --now sentinel-bot
      ```
+     注意：示例服务使用 `Restart=always`，因此**每次重启都会推送一条“服务已启动”
+     状态消息**（详见下文“推送机制”），这属于预期行为，可当作进程存活信号。
 
 ## 配置字段说明
 
@@ -74,13 +136,14 @@
 | `dedup_hours` | int | `1` | 同一 `key` 的去重时间窗（小时），`<=0` 关闭去重。 |
 | `db_path` | string | `"~/.local/share/sentinel/sentinel.db"` | sqlite 数据库路径，支持 `~`；目录不可写时自动回退当前目录。 |
 | `max_push_bytes` | int | `4000` | 企业微信推送内容的最大 UTF-8 字节数，超出自动截断。 |
+| `report_interval_hours` | int | `3` | 定时报告间隔（小时）；`run` 到点后推送双通道，`run --force` 可忽略间隔立即推送。 |
 
 ## CLI 命令用法
 
 ```bash
-# 1) run：采集 -> 去重 -> 入库 -> 推送
+# 1) run：采集 -> 去重 -> 入库 -> 双通道推送（告警即时推 + 到点定时报告）
 python3 sentinel.py run
-python3 sentinel.py run --force     # 无新事件时也推送“一切正常”汇总
+python3 sentinel.py run --force     # 忽略间隔，立即推送一次定时报告并更新时间戳
 
 # 2) check：逐个运行采集器，仅打印事件数量（只读，不入库不推送）
 python3 sentinel.py check
@@ -88,7 +151,7 @@ python3 sentinel.py check
 # 3) report：打印最近 N 小时事件（默认 24 小时）
 python3 sentinel.py report --hours 1
 
-# 4) bot：启动 Telegram 长轮询机器人
+# 4) bot：启动 Telegram 长轮询机器人（进入轮询前先推送一条启动状态）
 python3 sentinel.py bot
 ```
 

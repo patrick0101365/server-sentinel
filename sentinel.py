@@ -17,10 +17,18 @@ Phase 2 功能：
   * 命令处理器为纯函数：/help、/status、/ssh（离线可测）
   * CLI：bot（token 为空时清晰报错并 exit 2）
 
+Phase 3 功能（双通道主动推送）：
+  * 统一推送文本构建器：gather_server_info / build_report_text（纯函数、离线可测）
+  * Telegram 主动发送：send_telegram_message / push_telegram（urllib，纯文本，不依赖轮询）
+  * meta 表存储 last_report_ts；is_report_due 控制定时报告间隔（report_interval_hours）
+  * run：新告警即时推 + 到点推送定时报告，均走企业微信与 Telegram 双通道
+  * bot：启动时先推送一条“服务已启动”状态，再进入 getUpdates 长轮询
+
 设计原则：
   * 仅标准库，兼容 Python 3.8+（不使用 match、不使用运行时 X | Y 联合类型）
   * 每个采集器自带异常隔离：单个采集器失败只记日志，绝不拖垮整个 run
-  * 日志一律带时间戳；企业微信 Webhook 绝不原样输出（必须打码）
+  * 日志一律带时间戳；企业微信 Webhook / Telegram Token 绝不原样输出（必须打码）
+  * 推送失败只记日志，绝不影响 run / bot 的正常流程与退出码
 """
 
 import argparse
@@ -33,6 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -61,6 +70,7 @@ DEFAULT_CONFIG = {
     "dedup_hours": 1,
     "db_path": "~/.local/share/sentinel/sentinel.db",
     "max_push_bytes": 4000,
+    "report_interval_hours": 3,
 }
 
 # severity 的展示顺序与图标（critical 最严重，放最前面）
@@ -69,6 +79,13 @@ SEVERITY_ORDER = [
     ("warning", "🟡 警告"),
     ("info", "🔵 提示"),
 ]
+
+# severity -> 单字符图标，供统一报告的一行式事件使用（未知 severity 用 ⚪ 兜底）
+SEVERITY_ICONS = {
+    "critical": "🔴",
+    "warning": "🟡",
+    "info": "🔵",
+}
 
 # /proc/mounts 中需要跳过的“伪文件系统”。这些都是内核虚拟文件系统，
 # 讨论磁盘使用率没有意义（overlay 属于真实可写层，故不在此列，需照常统计）。
@@ -197,6 +214,9 @@ def load_config() -> Dict[str, Any]:
     )
     config["dedup_hours"] = _coerce_int(config.get("dedup_hours"), DEFAULT_CONFIG["dedup_hours"])
     config["max_push_bytes"] = _coerce_int(config.get("max_push_bytes"), DEFAULT_CONFIG["max_push_bytes"])
+    config["report_interval_hours"] = _coerce_int(
+        config.get("report_interval_hours"), DEFAULT_CONFIG["report_interval_hours"]
+    )
 
     # db_path 支持 ~ 展开；启动时确保父目录存在，否则 sqlite 打开会失败
     preferred_db = os.path.expanduser(str(config.get("db_path") or DEFAULT_CONFIG["db_path"]))
@@ -740,6 +760,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # key 是去重查询的核心条件，必须建索引；ts 用于时间窗和倒序查询
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_key ON events(key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+    # meta：存放 last_report_ts 等键值状态，供定时报告判定使用
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
     conn.commit()
 
 
@@ -852,6 +881,45 @@ def get_recent_events(db_path: str, hours: int) -> List[Dict[str, Any]]:
     return result
 
 
+def get_meta(db_path: str, key: str) -> Optional[str]:
+    """
+    读取 meta 表中的键值。键不存在或读取失败时返回 None（不抛异常）。
+    """
+    try:
+        conn = _connect(db_path)
+        try:
+            cursor = conn.execute("SELECT value FROM meta WHERE key = ?", (str(key),))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception as exc:
+        log("读取 meta 失败（key=%s）：%s" % (key, exc), "ERROR")
+        return None
+
+
+def set_meta(db_path: str, key: str, value: Any) -> bool:
+    """
+    写入/覆盖 meta 表中的键值（INSERT OR REPLACE）。
+
+    返回 True 表示写入成功，失败只记日志并返回 False。
+    """
+    try:
+        conn = _connect(db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (str(key), str(value)),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception as exc:
+        log("写入 meta 失败（key=%s）：%s" % (key, exc), "ERROR")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 规则层
 # ---------------------------------------------------------------------------
@@ -876,6 +944,24 @@ def filter_new_events(
         if not is_duplicate(db_path, key, dedup_hours):
             new_events.append(event)
     return new_events
+
+
+def is_report_due(db_path: str, interval_hours: Any) -> bool:
+    """
+    判断定时报告是否到点。
+
+    规则：meta 中无 last_report_ts 记录，或 now - last_report_ts >= interval_hours * 3600。
+    时间戳缺失/非法时保守地视为“到点”，保证不会长期不报告。
+    """
+    interval = _coerce_int(interval_hours, DEFAULT_CONFIG["report_interval_hours"])
+    last = get_meta(db_path, "last_report_ts")
+    if last is None or str(last).strip() == "":
+        return True
+    try:
+        last_ts = int(float(last))
+    except (TypeError, ValueError):
+        return True
+    return (int(time.time()) - last_ts) >= interval * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +996,236 @@ def _detail_summary(detail: Any) -> str:
     for key, value in detail.items():
         parts.append("%s=%s" % (key, value))
     return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 统一推送文本构建器（Phase 3）
+# ---------------------------------------------------------------------------
+# 设计要点：
+#   * gather_server_info 复用采集器的底层读取函数，单项失败只填“未知”，不抛异常；
+#   * build_report_text 是纯函数：不读系统、不发网络，便于离线单元测试；
+#   * 推送文本统一为高可读纯文本（emoji 小节标题 + 键名冒号对齐 + 每事件一行）。
+
+def _format_uptime_compact(seconds: Any) -> str:
+    """
+    把运行秒数格式化为紧凑中文（如“3小时42分”“2天3小时5分”）。
+
+    与 Phase 2 的 _format_uptime 不同：这里不带空格、分钟简称“分”，
+    用于统一报告里更紧凑的状态行。非法输入返回“未知”。
+    """
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return "未知"
+    if total < 0:
+        total = 0
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days > 0:
+        parts.append("%d天" % days)
+        parts.append("%d小时" % hours)
+    elif hours > 0:
+        parts.append("%d小时" % hours)
+    parts.append("%d分" % minutes)
+    return "".join(parts)
+
+
+def gather_server_info() -> Dict[str, Any]:
+    """
+    采集一份用于统一报告的服务器状态快照。
+
+    复用现有底层读取：_read_load1 / _read_meminfo / shutil.disk_usage("/") / _read_uptime。
+    返回字段：load1 / cpu_count / mem_percent / mem_used_gb / mem_total_gb /
+             disk_percent / uptime_str / now_str。
+    任何单项读取失败都只记日志并把该字段填为“未知”，绝不抛异常。
+    """
+    info: Dict[str, Any] = {
+        "load1": "未知",
+        "cpu_count": "未知",
+        "mem_percent": "未知",
+        "mem_used_gb": "未知",
+        "mem_total_gb": "未知",
+        "disk_percent": "未知",
+        "uptime_str": "未知",
+        "now_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    # 1) CPU 核数（os.cpu_count 在极少数平台可能返回 None）
+    try:
+        cpu_count = os.cpu_count()
+        info["cpu_count"] = int(cpu_count) if cpu_count else "未知"
+    except Exception as exc:
+        log("gather_server_info 读取 CPU 核数失败：%s" % exc, "WARNING")
+
+    # 2) 1 分钟负载
+    try:
+        load1 = _read_load1()
+        if load1 is not None:
+            info["load1"] = round(float(load1), 2)
+    except Exception as exc:
+        log("gather_server_info 读取负载失败：%s" % exc, "WARNING")
+
+    # 3) 内存使用率与用量（/proc/meminfo 以 kB 为单位）
+    try:
+        stats = _read_meminfo()
+        total = stats.get("MemTotal", 0)
+        if total > 0:
+            if "MemAvailable" in stats:
+                available = stats["MemAvailable"]
+            else:
+                # 旧内核兜底估算，与 collect_memory 保持一致
+                available = stats.get("MemFree", 0) + stats.get("Buffers", 0) + stats.get("Cached", 0)
+            used = total - available
+            if used < 0:
+                used = 0
+            info["mem_percent"] = round(used * 100.0 / total, 1)
+            info["mem_used_gb"] = round(used / 1024.0 / 1024.0, 1)
+            info["mem_total_gb"] = round(total / 1024.0 / 1024.0, 1)
+    except Exception as exc:
+        log("gather_server_info 读取内存失败：%s" % exc, "WARNING")
+
+    # 4) 根分区磁盘使用率
+    try:
+        usage = shutil.disk_usage("/")
+        if usage.total > 0:
+            info["disk_percent"] = round(usage.used * 100.0 / usage.total, 1)
+    except Exception as exc:
+        log("gather_server_info 读取根分区失败：%s" % exc, "WARNING")
+
+    # 5) 系统运行时间
+    try:
+        info["uptime_str"] = _format_uptime_compact(_read_uptime())
+    except Exception as exc:
+        log("gather_server_info 读取运行时间失败：%s" % exc, "WARNING")
+
+    return info
+
+
+def _display_width(text: Any) -> int:
+    """计算字符串的终端显示宽度（CJK 全角字符按 2 列计），用于冒号对齐。"""
+    width = 0
+    for char in str(text):
+        if unicodedata.east_asian_width(char) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _event_summary(event: Dict[str, Any]) -> str:
+    """
+    从事件 detail 中提炼一句话摘要。
+
+    按 category 挑选最关键的字段，保证每条事件只占一行；未知类别回退为
+    通用的 key=value 摘要，避免丢失信息。
+    """
+    detail = event.get("detail")
+    if not isinstance(detail, dict):
+        return _detail_summary(detail)
+    category = str(event.get("category", "")).lower()
+    if category == "process":
+        return "进程 %s 未运行" % detail.get("process", "未知")
+    if category == "memory":
+        return "使用率 %s%% ≥ 阈值 %s" % (
+            detail.get("usage_percent", "?"), detail.get("threshold", "?"))
+    if category == "disk":
+        return "挂载点 %s 使用率 %s%% ≥ 阈值 %s" % (
+            detail.get("mount", "?"), detail.get("usage_percent", "?"), detail.get("threshold", "?"))
+    if category == "load":
+        return "1分钟负载 %s ≥ 阈值 %s（%s 核）" % (
+            detail.get("load1", "?"), detail.get("threshold", "?"), detail.get("cpu_count", "?"))
+    if category == "ssh":
+        return "来源 IP %s 失败 %s 次（窗口 %s 小时，阈值 %s）" % (
+            detail.get("ip", "?"), detail.get("failed_count", "?"),
+            detail.get("window_hours", "?"), detail.get("threshold", "?"))
+    summary = _detail_summary(detail)
+    return summary if summary else "无详细信息"
+
+
+def _is_number(value: Any) -> bool:
+    """判断是否为可用于数值格式化的 int/float（bool 不算）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def build_report_text(
+    server_info: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    title: str = "Server Sentinel",
+) -> str:
+    """
+    构建统一的高可读纯文本报告（纯函数，可离线测试）。
+
+    版式：
+        🖥️ <title>
+        ⏰ <时间>
+
+        📊 服务器状态
+          <键名对齐>: <值>
+
+        🚨 异常事件 (N)
+          🔴 [CRITICAL] category key — 一句话摘要
+        （无事件时显示 ✅ 一切正常，无异常事件）
+    """
+    info = server_info if isinstance(server_info, dict) else {}
+
+    # 状态值格式化：任一相关字段不是数值时整行显示“未知”，避免半截数字 / 格式化异常
+    if not _is_number(info.get("load1")) or not _is_number(info.get("cpu_count")):
+        load_value = "未知"
+    else:
+        load_value = "%.2f (%d 核)" % (info.get("load1"), info.get("cpu_count"))
+
+    if (not _is_number(info.get("mem_percent")) or not _is_number(info.get("mem_used_gb"))
+            or not _is_number(info.get("mem_total_gb"))):
+        mem_value = "未知"
+    else:
+        mem_value = "%.1f%% (%.1f / %.1f GB)" % (
+            info.get("mem_percent"), info.get("mem_used_gb"), info.get("mem_total_gb"))
+
+    if not _is_number(info.get("disk_percent")):
+        disk_value = "未知"
+    else:
+        disk_value = "%.1f%%" % info.get("disk_percent")
+
+    uptime_value = info.get("uptime_str") or "未知"
+
+    status_rows = [
+        ("1分钟负载", load_value),
+        ("内存使用", mem_value),
+        ("根分区磁盘", disk_value),
+        ("运行时间", uptime_value),
+    ]
+    # 按显示宽度对齐冒号（CJK 全角按 2 列计）
+    label_width = max(_display_width(label) for label, _ in status_rows)
+
+    lines = [
+        "🖥️ %s" % title,
+        "⏰ %s" % (info.get("now_str") or "未知"),
+        "",
+        "📊 服务器状态",
+    ]
+    for label, value in status_rows:
+        pad = label_width - _display_width(label)
+        lines.append("  %s%s: %s" % (label, " " * pad, value))
+
+    lines.append("")
+    if events:
+        lines.append("🚨 异常事件 (%d)" % len(events))
+        for event in events:
+            severity = str(event.get("severity", "info")).lower()
+            icon = SEVERITY_ICONS.get(severity, "⚪")
+            lines.append("  %s [%s] %s %s — %s" % (
+                icon,
+                severity.upper(),
+                str(event.get("category", "-")),
+                str(event.get("key", "-")),
+                _event_summary(event),
+            ))
+    else:
+        lines.append("✅ 一切正常，无异常事件")
+
+    return "\n".join(lines)
 
 
 def format_wecom_message(events: List[Dict[str, Any]]) -> str:
@@ -948,16 +1264,15 @@ def format_wecom_message(events: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def send_wecom(webhook: str, events: List[Dict[str, Any]], max_push_bytes: int) -> bool:
+def send_wecom_text(webhook: str, text: str, max_push_bytes: int) -> bool:
     """
-    通过企业微信机器人 Webhook 推送事件。
+    向企业微信机器人 Webhook 推送任意文本内容（Phase 3 统一报告走这里）。
 
-    返回 True 表示推送成功，False 表示跳过或失败。
-    绝不抛异常：网络问题/对方限流只记日志，不影响 run 的主流程。
-    webhook 为空时不报错，直接返回 False。
+    返回 True 表示推送成功，False 表示跳过或失败。绝不抛异常：
+    网络问题/对方限流只记日志，不影响 run 的主流程。webhook 为空时返回 False。
     """
     if not webhook:
-        log("未配置 wecom_webhook，跳过企业微信推送", "WARNING")
+        log("未配置 wecom_webhook，跳过企业微信推送", "INFO")
         return False
 
     # 组装文本并做字节级截断
@@ -965,8 +1280,7 @@ def send_wecom(webhook: str, events: List[Dict[str, Any]], max_push_bytes: int) 
         max_bytes = int(max_push_bytes)
     except (TypeError, ValueError):
         max_bytes = DEFAULT_CONFIG["max_push_bytes"]
-    content = format_wecom_message(events)
-    content = truncate_utf8(content, max_bytes)
+    content = truncate_utf8(text, max_bytes)
     payload = {
         "msgtype": "markdown",
         "markdown": {"content": content},
@@ -977,9 +1291,9 @@ def send_wecom(webhook: str, events: List[Dict[str, Any]], max_push_bytes: int) 
         log("企业微信消息序列化失败：%s" % exc, "ERROR")
         return False
 
-    # 日志只打印打码后的地址，绝不打印原始 webhook
-    log("企业微信推送：url=%s 事件数=%d 内容字节数=%d" % (
-        mask_webhook(webhook), len(events), len(content.encode("utf-8"))), "INFO")
+    # 日志只打印打码后的地址与内容字节数，绝不打印原始 webhook
+    log("企业微信推送：url=%s 内容字节数=%d" % (
+        mask_webhook(webhook), len(content.encode("utf-8"))), "INFO")
     try:
         # Request 构造也放进 try：非法 URL（如缺协议）会在此抛 ValueError
         request = urllib.request.Request(
@@ -1014,6 +1328,15 @@ def send_wecom(webhook: str, events: List[Dict[str, Any]], max_push_bytes: int) 
 
     log("企业微信推送成功（HTTP %s）" % status, "INFO")
     return True
+
+
+def send_wecom(webhook: str, events: List[Dict[str, Any]], max_push_bytes: int) -> bool:
+    """
+    通过企业微信机器人 Webhook 推送事件列表（Phase 1 接口，保留兼容）。
+
+    内部转成 Markdown 文本后交给 send_wecom_text 发送。
+    """
+    return send_wecom_text(webhook, format_wecom_message(events), max_push_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -1257,13 +1580,14 @@ def _telegram_call(
         log("Telegram 参数序列化失败（%s）：%s" % (method, exc), "ERROR")
         return None
 
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
     try:
+        # Request 构造也放进 try：非法 URL（如 token 含空格/特殊字符）可能抛 ValueError
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
@@ -1315,22 +1639,54 @@ def _telegram_get_updates(token: str, offset: Optional[int]) -> Optional[List[Di
 
 def send_telegram_message(token: str, chat_id: Any, text: str) -> bool:
     """
-    发送 Markdown 文本；若 Markdown 解析失败，自动降级为纯文本重发一次。
+    发送纯文本 Telegram 消息（不设置 parse_mode，避免动态内容触发解析错误）。
+
+    token / chat_id 为空直接返回 False；网络异常 / HTTP 错误 / Telegram 返回
+    ok=false 只记日志并返回 False，绝不抛异常。
     """
+    if not token:
+        log("未配置 telegram_bot_token，跳过 Telegram 发送", "INFO")
+        return False
+    if chat_id is None or str(chat_id).strip() == "":
+        log("chat_id 为空，跳过 Telegram 发送", "WARNING")
+        return False
     if not text:
         text = "(空消息)"
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    if _telegram_call(token, "sendMessage", payload, timeout=10) is not None:
-        return True
-    # 降级：去掉 parse_mode 再发一次，尽量避免因转义问题丢消息
-    log("Markdown 发送失败，降级为纯文本重发（chat_id=%s）" % chat_id, "WARNING")
-    plain = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    return _telegram_call(token, "sendMessage", plain, timeout=10) is not None
+    # _telegram_call 已统一处理网络/HTTP/ok=false 异常，成功返回 result、失败返回 None
+    return _telegram_call(token, "sendMessage", payload, timeout=10) is not None
+
+
+def push_telegram(config: Dict[str, Any], text: str) -> bool:
+    """
+    主动向 telegram_allowed_chat_ids 中的每个 chat 推送同一条文本。
+
+    token 为空或白名单为空时只记 INFO 并跳过；逐个发送，任一失败不影响其余。
+    返回 True 表示至少有一个 chat 发送成功。
+    """
+    token = str(config.get("telegram_bot_token") or "").strip()
+    if not token:
+        log("未配置 telegram_bot_token，跳过 Telegram 推送", "INFO")
+        return False
+
+    raw_ids = config.get("telegram_allowed_chat_ids") or []
+    if not isinstance(raw_ids, (list, tuple, set)):
+        raw_ids = [raw_ids]
+    chat_ids = [item for item in raw_ids if item is not None and str(item).strip() != ""]
+    if not chat_ids:
+        log("telegram_allowed_chat_ids 为空，跳过 Telegram 推送", "INFO")
+        return False
+
+    success = 0
+    for chat_id in chat_ids:
+        if send_telegram_message(token, chat_id, text):
+            success += 1
+    log("Telegram 推送完成：成功 %d/%d" % (success, len(chat_ids)), "INFO")
+    return success > 0
 
 
 def process_update(config: Dict[str, Any], token: str, update: Dict[str, Any]) -> None:
@@ -1368,6 +1724,17 @@ def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int
     if not allowed:
         log("telegram_allowed_chat_ids 为空：所有消息都会被忽略（请在配置中添加 chat_id）", "WARNING")
 
+    # 启动推送：先播报一条“服务已启动”状态，再进入长轮询。
+    # systemd Restart=always 下每次重启都会推一次，这是符合预期的行为（README 已注明）。
+    try:
+        startup_text = build_report_text(
+            gather_server_info(), [], title="🚀 Server Sentinel 服务已启动"
+        )
+        push_telegram(config, startup_text)
+    except Exception as exc:
+        # 启动推送无论如何都不能阻断 bot 主循环
+        log("启动推送异常（已忽略）：%s" % exc, "ERROR")
+
     offset: Optional[int] = None
     backoff = 1
     while True:
@@ -1402,13 +1769,27 @@ def run_telegram_bot(config: Dict[str, Any], token: Optional[str] = None) -> int
 # CLI 子命令
 # ---------------------------------------------------------------------------
 
+def push_all_channels(config: Dict[str, Any], text: str) -> bool:
+    """
+    把同一条文本同时推送到企业微信与 Telegram 两个通道。
+
+    任一通道未配置只记 INFO 跳过；发送失败只记日志，返回值仅表示是否
+    至少一个通道成功，调用方（run）不依赖它决定退出码。
+    """
+    wecom_ok = send_wecom_text(config["wecom_webhook"], text, config["max_push_bytes"])
+    telegram_ok = push_telegram(config, text)
+    return wecom_ok or telegram_ok
+
+
 def cmd_run(config: Dict[str, Any], force: bool) -> int:
     """
     run 子命令主流程。
 
-    采集 -> 规则过滤 -> 存库 -> 有新事件推送；无新事件时：
-      * --force：推送“一切正常”汇总
-      * 否则只记日志，不推送
+    采集 -> 规则过滤 -> 存库（保持不变）；随后：
+      * 有新告警事件：即时推双通道（标题“🚨 ... 告警”）；
+      * 定时报告：到点（或 --force）推双通道（标题“📋 ... 定时报告”）并更新
+        meta.last_report_ts；无事件时报告显示“一切正常”。
+    推送异常绝不影响退出码，始终返回 0。
     """
     log("=== Sentinel run 开始 ===", "INFO")
     start = time.time()
@@ -1423,13 +1804,29 @@ def cmd_run(config: Dict[str, Any], force: bool) -> int:
     # 无论是否推送，本次采集到的全部事件都要落库，保证 report 有完整历史
     save_events(config["db_path"], events)
 
+    # 状态快照供告警与定时报告共用，避免重复读取内核数据
+    server_info = gather_server_info()
+
+    # 1) 有新的告警事件 -> 即时推双通道
     if new_events:
-        send_wecom(config["wecom_webhook"], new_events, config["max_push_bytes"])
-    elif force:
-        log("无新事件，--force 已开启，推送“一切正常”汇总", "INFO")
-        send_wecom(config["wecom_webhook"], [], config["max_push_bytes"])
+        alert_text = build_report_text(server_info, new_events, title="🚨 Server Sentinel 告警")
+        push_all_channels(config, alert_text)
     else:
-        log("无新事件，跳过推送（可加 --force 强制发送正常汇总）", "INFO")
+        log("无新告警事件，跳过即时告警推送", "INFO")
+
+    # 2) 定时报告 -> 到点（或 --force）推双通道并更新时间戳
+    interval = config.get("report_interval_hours", DEFAULT_CONFIG["report_interval_hours"])
+    due = True if force else is_report_due(config["db_path"], interval)
+    if due:
+        if force:
+            log("--force 已开启：立即推送一次定时报告", "INFO")
+        report_text = build_report_text(server_info, new_events, title="📋 Server Sentinel 定时报告")
+        push_all_channels(config, report_text)
+        # 报告内容可能因双通道截断而略变，但时间戳始终以实际推送时刻为准
+        set_meta(config["db_path"], "last_report_ts", str(int(time.time())))
+        log("定时报告已推送（间隔=%sh），last_report_ts 已更新" % interval, "INFO")
+    else:
+        log("未到定时报告时间（间隔=%sh），跳过定时报告" % interval, "INFO")
 
     log("=== Sentinel run 结束，耗时 %.2fs ===" % (time.time() - start), "INFO")
     return 0
@@ -1507,10 +1904,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", help="子命令")
 
     # run：完整巡检流程
-    run_parser = subparsers.add_parser("run", help="采集 -> 入库 -> 去重 -> 推送")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="采集 -> 入库 -> 去重 -> 双通道推送（告警即时推 + 定时报告）",
+    )
     run_parser.add_argument(
         "--force", action="store_true",
-        help="无新事件时也推送“一切正常”汇总",
+        help="忽略报告间隔，立即推送一次定时报告（企业微信 + Telegram 双通道）",
     )
 
     # check：只读自检
@@ -1524,7 +1924,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # bot：Telegram 长轮询机器人
-    subparsers.add_parser("bot", help="启动 Telegram 机器人（getUpdates 长轮询）")
+    subparsers.add_parser(
+        "bot",
+        help="启动 Telegram 机器人（先推送启动状态，再 getUpdates 长轮询）",
+    )
 
     return parser
 

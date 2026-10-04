@@ -1,0 +1,14 @@
+{
+  "wecom_webhook": "",
+  "telegram_bot_token": "",
+  "telegram_allowed_chat_ids": [123456789],
+  "ssh_threshold": 20,
+  "ssh_window_hours": 1,
+  "disk_threshold": 85,
+  "memory_threshold": 90,
+  "load_multiplier": 2.0,
+  "watch_processes": ["sshd"],
+  "dedup_hours": 1,
+  "db_path": "~/.local/share/sentinel/sentinel.db",
+  "max_push_bytes": 4000
+}

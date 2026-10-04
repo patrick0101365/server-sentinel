@@ -1,0 +1,21 @@
+[Unit]
+Description=Server Sentinel Telegram Bot
+# 网络就绪后再启动，避免开机时 getUpdates 立即失败
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 安全提示：请勿使用 root 运行。把 User= 替换成实际的低权限用户，
+# 例如 User=sentinel（需提前创建该用户，并确保它能读取配置文件与数据库）。
+User=sentinel
+# 路径替换说明：/opt/server-sentinel/sentinel.py 是示例绝对路径，
+# 请替换成你实际部署 sentinel.py 的绝对路径。
+ExecStart=/usr/bin/python3 /opt/server-sentinel/sentinel.py bot
+# 可选：用 SENTINEL_CONFIG 指定配置文件路径（默认 ~/.config/sentinel/config.json）
+# Environment=SENTINEL_CONFIG=/opt/server-sentinel/config.json
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

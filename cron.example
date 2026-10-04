@@ -1,0 +1,14 @@
+# Server Sentinel 定时巡检示例（crontab）
+#
+# 每 30 分钟执行一次 run：采集 -> 去重 -> 入库 -> 推送
+*/30 * * * * /usr/bin/python3 /opt/server-sentinel/sentinel.py run
+#
+# 建议把 stdout / stderr 重定向到日志文件，便于排查问题（INFO 走 stdout，
+# WARNING/ERROR 走 stderr，2>&1 可一并收集）：
+# */30 * * * * /usr/bin/python3 /opt/server-sentinel/sentinel.py run >> /var/log/sentinel.log 2>&1
+#
+# 若使用自定义配置文件，可用 SENTINEL_CONFIG 指定（cron 环境变量需写在命令前）：
+# */30 * * * * SENTINEL_CONFIG=/opt/server-sentinel/config.json /usr/bin/python3 /opt/server-sentinel/sentinel.py run >> /var/log/sentinel.log 2>&1
+#
+# 提示：cron 的 PATH 较精简，python3 / sentinel.py 建议写绝对路径；
+# 记得提前创建 /var/log/sentinel.log 并设置合适的属主与权限。

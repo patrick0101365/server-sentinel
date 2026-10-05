@@ -23,7 +23,7 @@
 - **白名单安全边界**：仅处理 `telegram_allowed_chat_ids` 内的 `chat.id`，非白名单消息只记 INFO 日志，不回复、不泄露信息。
 - **命令处理器为纯函数**，返回文本、便于离线单测：
   - `/help`：列出全部命令。
-  - `/status`：实时状态（1 分钟负载、内存使用率、根分区磁盘使用率、系统运行时间）。
+  - `/status`：实时状态（当前登录用户、1 分钟负载、内存使用率、根分区磁盘使用率、系统运行时间）。
   - `/ssh`：最近 1 小时 `category='ssh'` 事件按来源 IP 聚合展示。
   - 未知命令：提示使用 `/help`。
 - **回复**：`sendMessage` 纯文本（不设 `parse_mode`），网络/HTTP/`ok=false` 只记日志不抛出。
@@ -42,6 +42,14 @@
 - **配置 `telegram_proxy`**：默认 `""`（直连）；填写后 Telegram 的 `sendMessage` / `getUpdates` 全部经该 HTTP/HTTPS 代理，适配国内服务器无法直连 `api.telegram.org` 的场景。
 - **只影响 Telegram**：企业微信（`qyapi.weixin.qq.com` 国内可直连）的发送函数完全不读取该配置，始终直连。
 - **安全与容错**：代理 URL 中的 `user:pass` 认证信息在日志中打码；`socks5://` 等不支持的 scheme 记 WARNING 后回退直连；代理连接失败只记 ERROR 日志并返回 False / 触发退避，绝不抛出。
+
+### Phase 5（登录用户展示）
+- **交互式登录**：`_read_logged_in_users()` 解析 `who`（utmp），返回用户 / 终端 / 登录时间 / 来源，方式推导为本地控制台（tty*/seat*）/ SSH（pts* + 来源 IP）/ 本地终端。
+- **SSH 会话补全**：`who` 看不到非交互式 SSH 会话（`sshd: user@notty`，如 `ssh host command`）。`_read_ssh_sessions()` 用 `ps` 找会话进程拿用户与已连接时长，再从 `/var/log/auth.log` 的 `Accepted` 记录按"同用户 + 登录时刻最接近"归属远端 IP（yzy 在 `adm` 组可读，无需 root）。
+- **为什么不用 /proc/<pid>/fd**：sshd 子进程不可 dump，同用户也读不到它的 fd；且 accepted socket 的 uid 归属为 root，uid 反查走不通。auth.log 是唯一精确且无特权的归属来源。
+- **定时报告顶部**：`build_report_text` 在时间行之后、服务器状态之前插入 `👥 当前登录` 节；who 覆盖不到的会话追加为"<用户> · 命令会话 · 来自 <IP> · 已连接 <时长>"；无会话显示"无登录会话"，读取失败显示"读取失败"。
+- **`/status` 同步**：Telegram `/status` 首节同样展示当前登录（含 SSH 会话，Markdown 版式）。
+- **固有限制**：匹配不到 Accepted 记录（如日志已轮转）的会话 IP 显示"未知"。
 
 ## 推送机制
 
@@ -81,6 +89,9 @@
 ```
 🖥️ Server Sentinel
 ⏰ 2026-10-04 11:40:00
+
+👥 当前登录
+  yzy · pts/0 · SSH 来自 222.93.13.126 · 2026-10-04 11:35
 
 📊 服务器状态
   1分钟负载 : 0.59 (2 核)

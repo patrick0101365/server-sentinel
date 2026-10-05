@@ -52,7 +52,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -1047,13 +1047,233 @@ def _format_uptime_compact(seconds: Any) -> str:
     return "".join(parts)
 
 
+def _parse_who_output(output: str) -> List[Dict[str, str]]:
+    """
+    解析 who 命令输出为登录会话列表（纯函数，可离线测试）。
+
+    who 行格式：<用户> <终端> <日期> <时间> [(来源)]
+    method 推导：tty* → 本地控制台；pts* + 有来源 → SSH；pts* 无来源 → 本地终端。
+    注意：非交互式 SSH 会话（notty，如 ssh host command）不写入 utmp，
+    who 看不到它们——这是 utmp 机制的固有限制，不是解析 bug。
+    """
+    users: List[Dict[str, str]] = []
+    for line in (output or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        user, terminal, date, time_ = parts[0], parts[1], parts[2], parts[3]
+        # 来源字段可能含空格（如 "(login screen)"），需拼接后再去括号
+        host = " ".join(parts[4:]).strip("()") if len(parts) >= 5 else ""
+        if terminal.startswith("tty") or terminal.startswith("seat") or terminal == ":0":
+            method = "本地控制台"
+        elif terminal.startswith("pts"):
+            method = "SSH" if host else "本地终端"
+        else:
+            method = "未知"
+        users.append({
+            "user": user,
+            "terminal": terminal,
+            "login_time": "%s %s" % (date, time_),
+            "host": host,
+            "method": method,
+        })
+    return users
+
+
+def _read_logged_in_users() -> Optional[List[Dict[str, str]]]:
+    """读取当前交互式登录会话；who 执行失败返回 None（调用方显示"读取失败"）。"""
+    try:
+        proc = subprocess.run(["who"], capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            log("读取登录会话失败：who 返回码 %s" % proc.returncode, "WARNING")
+            return None
+    except Exception as exc:
+        log("读取登录会话失败：%s" % exc, "WARNING")
+        return None
+    return _parse_who_output(proc.stdout)
+
+
+def _parse_auth_accepts(text: str) -> List[Dict[str, Any]]:
+    """
+    解析 auth.log 文本，提取 Accepted 登录记录（纯函数，可离线测试）。
+
+    行格式如：`... sshd[123]: Accepted publickey for muse from 1.2.3.4 port 5678 ssh2...`
+    兼容 ISO8601（2026-10-05T20:08:23+08:00，rsyslog 默认）与传统 syslog
+    （Oct  5 20:08:23，无年份，按当年解析）两种时间戳。返回按时间正序的
+    [{"time": datetime（naive，服务器本地时区）, "user", "ip"}]。
+    """
+    accepts: List[Dict[str, Any]] = []
+    this_year = datetime.now().year
+    for line in (text or "").splitlines():
+        if "Accepted " not in line:
+            continue
+        m = re.search(
+            r"Accepted (?:publickey|password|keyboard-interactive|hostbased)"
+            r" for (\S+) from (\S+) port",
+            line)
+        if not m:
+            continue
+        user, ip = m.group(1), m.group(2)
+        ts = None
+        m_iso = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})", line)
+        if m_iso:
+            try:
+                ts = datetime.strptime(m_iso.group(1) + " " + m_iso.group(2),
+                                       "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                ts = None
+        else:
+            m_sys = re.match(r"([A-Za-z]{3})\s+(\d{1,2}) (\d{2}):(\d{2}):(\d{2})", line)
+            if m_sys:
+                try:
+                    mon = ("jan", "feb", "mar", "apr", "may", "jun",
+                           "jul", "aug", "sep", "oct", "nov", "dec").index(
+                               m_sys.group(1).lower()) + 1
+                    ts = datetime(this_year, mon, int(m_sys.group(2)),
+                                  int(m_sys.group(3)), int(m_sys.group(4)),
+                                  int(m_sys.group(5)))
+                except ValueError:
+                    ts = None
+        if ts is None:
+            continue
+        accepts.append({"time": ts, "user": user, "ip": ip})
+    return accepts
+
+
+def _etime_to_seconds(elapsed: str) -> Optional[int]:
+    """ps etime（MM:SS / HH:MM:SS / D-HH:MM:SS）→ 秒；解析失败返回 None。"""
+    try:
+        days = 0
+        rest = elapsed.strip()
+        if "-" in rest:
+            d, rest = rest.split("-", 1)
+            days = int(d)
+        parts = [int(p) for p in rest.split(":")]
+        total = days * 86400
+        mult = 1
+        for p in reversed(parts):
+            total += p * mult
+            mult *= 60
+        return total
+    except (ValueError, AttributeError):
+        return None
+
+
+def _read_auth_accepts(max_lines: int = 20000) -> List[Dict[str, Any]]:
+    """读 /var/log/auth.log 尾部，提取 Accepted 记录；读不到返回空列表。"""
+    try:
+        with open("/var/log/auth.log", "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as exc:
+        log("读取 auth.log 失败：%s" % exc, "WARNING")
+        return []
+    return _parse_auth_accepts("".join(lines[-max_lines:]))
+
+
+def _attribute_session_hosts_via_authlog(
+        sessions: List[Dict[str, str]],
+        accepts: List[Dict[str, Any]],
+        now: Optional[datetime] = None,
+        window_seconds: int = 120) -> List[Dict[str, str]]:
+    """
+    按"用户相同且登录时刻最接近（now - elapsed）"把 auth.log 的 IP 归属到会话（纯函数）。
+
+    每条 accept 记录只用一次（取时间差最小且在窗口内的）；匹配不到记"未知"。
+    """
+    now = now or datetime.now()
+    used = set()
+    result: List[Dict[str, str]] = []
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        host = "未知"
+        secs = _etime_to_seconds(s.get("elapsed", ""))
+        if secs is not None:
+            start = now - timedelta(seconds=secs)
+            best, best_dt = None, None
+            for i, a in enumerate(accepts):
+                if i in used or a.get("user") != s.get("user"):
+                    continue
+                a_time = a.get("time")
+                if not isinstance(a_time, datetime):
+                    continue
+                dt = abs((a_time - start).total_seconds())
+                if dt <= window_seconds and (best_dt is None or dt < best_dt):
+                    best, best_dt = i, dt
+            if best is not None:
+                used.add(best)
+                host = accepts[best].get("ip", "未知")
+        result.append({"user": s.get("user", "?"), "tty": s.get("tty", "?"),
+                       "host": host, "elapsed": s.get("elapsed", "?")})
+    return result
+
+def _parse_sshd_ps(output: str) -> List[Dict[str, str]]:
+    """
+    解析 ps -o pid=,etime=,args= -C sshd 输出，提取会话进程（纯函数，可离线测试）。
+
+    会话行形如 `3360199 12:43 sshd: yzy@notty`；跳过监听进程（sshd -D）
+    和特权监控进程（sshd: user [priv]，无 @）。tty 为 notty 表示非交互式命令会话。
+    """
+    sessions: List[Dict[str, str]] = []
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, elapsed, args = parts
+        m = re.match(r"sshd:\s+(\S+)@(\S+)", args)
+        if not m:
+            continue
+        sessions.append({"pid": pid, "user": m.group(1),
+                         "tty": m.group(2), "elapsed": elapsed})
+    return sessions
+
+
+def _read_ssh_sessions() -> Optional[List[Dict[str, str]]]:
+    """
+    读取当前 sshd 会话：用户 / 终端类型 / 远端 IP / 已连接时长。
+
+    ps 找 `sshd: user@tty` 会话进程拿用户与已连接时长；远端 IP 从
+    /var/log/auth.log 的 Accepted 记录按"同用户 + 登录时刻最接近"归属。
+    全部 world-readable（yzy 在 adm 组可读 auth.log），不需要 root；
+    ps 失败返回 None。
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "pid=", "-o", "etime=", "-o", "args=", "-C", "sshd"],
+            capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            log("读取 sshd 会话失败：ps 返回码 %s" % proc.returncode, "WARNING")
+            return None
+    except Exception as exc:
+        log("读取 sshd 会话失败：%s" % exc, "WARNING")
+        return None
+    sessions = _parse_sshd_ps(proc.stdout)
+    if not sessions:
+        return []
+    return _attribute_session_hosts_via_authlog(sessions, _read_auth_accepts())
+
+def _ssh_sessions_missing_from_who(
+        who_users: Optional[List[Dict[str, str]]],
+        ssh_sessions: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+    """
+    返回 who 覆盖不到的 sshd 会话（纯函数）。
+
+    notty 会话必收（who 永远看不到它们）；pts 会话若终端已在 who 中则去重跳过。
+    """
+    if not isinstance(ssh_sessions, list):
+        return []
+    who_terms = {u.get("terminal") for u in (who_users or []) if isinstance(u, dict)}
+    return [s for s in ssh_sessions
+            if isinstance(s, dict) and (s.get("tty") == "notty" or s.get("tty") not in who_terms)]
+
+
 def gather_server_info() -> Dict[str, Any]:
     """
     采集一份用于统一报告的服务器状态快照。
 
     复用现有底层读取：_read_load1 / _read_meminfo / shutil.disk_usage("/") / _read_uptime。
     返回字段：load1 / cpu_count / mem_percent / mem_used_gb / mem_total_gb /
-             disk_percent / uptime_str / now_str。
+             disk_percent / uptime_str / now_str / logged_in_users / ssh_sessions。
     任何单项读取失败都只记日志并把该字段填为“未知”，绝不抛异常。
     """
     info: Dict[str, Any] = {
@@ -1114,6 +1334,20 @@ def gather_server_info() -> Dict[str, Any]:
         info["uptime_str"] = _format_uptime_compact(_read_uptime())
     except Exception as exc:
         log("gather_server_info 读取运行时间失败：%s" % exc, "WARNING")
+
+    # 6) 当前登录用户（who / utmp；失败时为 None，报告里显示"读取失败"）
+    try:
+        info["logged_in_users"] = _read_logged_in_users()
+    except Exception as exc:
+        log("gather_server_info 读取登录用户失败：%s" % exc, "WARNING")
+        info["logged_in_users"] = None
+
+    # 7) sshd 会话（含 who 看不到的非交互式连接；失败时为 None）
+    try:
+        info["ssh_sessions"] = _read_ssh_sessions()
+    except Exception as exc:
+        log("gather_server_info 读取 sshd 会话失败：%s" % exc, "WARNING")
+        info["ssh_sessions"] = None
 
     return info
 
@@ -1176,6 +1410,11 @@ def build_report_text(
         🖥️ <title>
         ⏰ <时间>
 
+        👥 当前登录
+          <用户> · <终端> · <方式>[ 来自 <来源>] · <登录时间>
+          <用户> · 命令会话 · 来自 <IP> · 已连接 <时长>   ← who 看不到的非交互 SSH
+        （无会话时显示"无登录会话"，读取失败显示"读取失败"）
+
         📊 服务器状态
           <键名对齐>: <值>
 
@@ -1218,8 +1457,34 @@ def build_report_text(
         "🖥️ %s" % title,
         "⏰ %s" % (info.get("now_str") or "未知"),
         "",
-        "📊 服务器状态",
+        "👥 当前登录",
     ]
+    users = info.get("logged_in_users")
+    ssh_sessions = info.get("ssh_sessions")
+    extra = _ssh_sessions_missing_from_who(users, ssh_sessions)
+    if users is None:
+        lines.append("  登录信息读取失败")
+    elif isinstance(users, list):
+        if not users and not extra:
+            lines.append("  无登录会话")
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            # 来源只对 SSH 有意义（IP 才值得看）；控制台的来源只是终端名回显，不显示
+            if u.get("method") == "SSH" and u.get("host"):
+                host_part = " 来自 %s" % u["host"]
+            else:
+                host_part = ""
+            lines.append("  %s · %s · %s%s · %s" % (
+                u.get("user", "?"), u.get("terminal", "?"),
+                u.get("method", "?"), host_part, u.get("login_time", "?")))
+    for s in extra:
+        tty_label = "命令会话" if s.get("tty") == "notty" else "终端 %s" % s.get("tty")
+        lines.append("  %s · %s · 来自 %s · 已连接 %s" % (
+            s.get("user", "?"), tty_label, s.get("host", "未知"), s.get("elapsed", "?")))
+    if ssh_sessions is None:
+        lines.append("  SSH 会话：读取失败")
+    lines.extend(["", "📊 服务器状态"])
     for label, value in status_rows:
         pad = label_width - _display_width(label)
         lines.append("  %s%s: %s" % (label, " " * pad, value))
@@ -1441,6 +1706,45 @@ def handle_help() -> str:
 def handle_status(config: Dict[str, Any]) -> str:
     """/status：返回实时状态文本（单项读取失败不影响整体返回）。"""
     lines = ["🖥️ *Server Sentinel 实时状态*", ""]
+
+    # 当前登录用户（与定时报告顶部的 👥 当前登录一致，含 who 看不到的 SSH 会话）
+    try:
+        users = _read_logged_in_users()
+    except Exception as exc:
+        log("status 读取登录用户失败：%s" % exc, "ERROR")
+        users = None
+    try:
+        ssh_sessions = _read_ssh_sessions()
+    except Exception as exc:
+        log("status 读取 sshd 会话失败：%s" % exc, "ERROR")
+        ssh_sessions = None
+    extra = _ssh_sessions_missing_from_who(users, ssh_sessions)
+    if users is None and not extra:
+        lines.append("*当前登录*：读取失败")
+    else:
+        if isinstance(users, list) and not users and not extra:
+            lines.append("*当前登录*：无登录会话")
+        else:
+            lines.append("*当前登录*：")
+        if isinstance(users, list):
+            for u in users:
+                if not isinstance(u, dict):
+                    continue
+                if u.get("method") == "SSH" and u.get("host"):
+                    host_part = " 来自 `%s`" % _md_escape(u["host"])
+                else:
+                    host_part = ""
+                lines.append("- `%s` · %s · %s%s · %s" % (
+                    _md_escape(u.get("user", "?")), u.get("terminal", "?"),
+                    u.get("method", "?"), host_part, u.get("login_time", "?")))
+        for s in extra:
+            tty_label = "命令会话" if s.get("tty") == "notty" else "终端 %s" % s.get("tty")
+            lines.append("- `%s` · %s · 来自 %s · 已连接 %s" % (
+                _md_escape(s.get("user", "?")), tty_label,
+                s.get("host", "未知"), s.get("elapsed", "?")))
+        if ssh_sessions is None:
+            lines.append("- SSH 会话：读取失败")
+    lines.append("")
 
     # 1 分钟负载（复用采集器的 /proc/loadavg 读取）
     try:
